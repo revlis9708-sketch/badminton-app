@@ -1,0 +1,88 @@
+name: Keep Supabase Alive
+
+# ═══════════════════════════════════════════════════════════
+#  Supabaseの無料プランは「1週間、実ユーザーのDB書き込みが
+#  少ない」と自動で一時停止されます（公式仕様）。
+#  単なるSELECTでは不十分なことがあるため、専用テーブルへ
+#  毎日INSERTして確実に「アクティビティあり」と記録させます。
+#
+#  ★事前準備（1回だけ）:
+#    1. Supabase SQL Editor で keepalive_table.sql を実行
+#    2. このファイルを .github/workflows/keep-alive.yml に配置
+#    3. Settings→Actions→General→Workflow permissions を
+#       「Read and write permissions」に設定
+#    4. Actionsタブで Enable → Run workflow で動作確認
+# ═══════════════════════════════════════════════════════════
+
+on:
+  schedule:
+    # 毎日 UTC 21:00（日本時間 翌6:00）に実行。
+    # 毎日書き込むことで7日ルールに絶対に引っかからないようにする。
+    - cron: '0 21 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ① 専用テーブルへ INSERT（＝実ユーザーの書き込みとして記録される）
+      - name: Write to keepalive table (counts as real activity)
+        run: |
+          echo "=== INSERT into keepalive ==="
+          RESP=$(curl -s -w "\nHTTP_%{http_code}" -X POST \
+            -H "apikey: sb_publishable_5n4MzBgkg-B9-VUrLcjh8A_3JavCe8E" \
+            -H "Authorization: Bearer sb_publishable_5n4MzBgkg-B9-VUrLcjh8A_3JavCe8E" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=representation" \
+            -d "{\"note\":\"github-actions keepalive $(date -u '+%Y-%m-%dT%H:%M:%SZ')\"}" \
+            "https://frmbdsmhcdfglkbynteu.supabase.co/rest/v1/keepalive")
+          echo "$RESP"
+          CODE=$(echo "$RESP" | grep -o 'HTTP_[0-9]*' | grep -o '[0-9]*')
+          echo "INSERT status: $CODE"
+          # 201 / 200 以外なら失敗として扱う
+          if [ "$CODE" != "201" ] && [ "$CODE" != "200" ]; then
+            echo "::warning::keepalive INSERT did not return 200/201 (got $CODE). Check the table exists and RLS allows anon INSERT."
+          fi
+
+      # ② 念のため既存テーブルにも SELECT（二重の保険）
+      - name: Also read core tables
+        run: |
+          echo "=== SELECT buyers ==="
+          curl -s -o /dev/null -w "buyers HTTP %{http_code}\n" \
+            -H "apikey: sb_publishable_5n4MzBgkg-B9-VUrLcjh8A_3JavCe8E" \
+            "https://frmbdsmhcdfglkbynteu.supabase.co/rest/v1/buyers?select=id&limit=1"
+          echo "=== SELECT keepalive count ==="
+          curl -s -w "\nkeepalive HTTP %{http_code}\n" \
+            -H "apikey: sb_publishable_5n4MzBgkg-B9-VUrLcjh8A_3JavCe8E" \
+            "https://frmbdsmhcdfglkbynteu.supabase.co/rest/v1/keepalive?select=id&limit=1"
+
+      # ③ 古いkeepalive行を掃除（テーブル肥大化を防ぐ／これも書き込み活動になる）
+      - name: Prune old keepalive rows
+        run: |
+          echo "=== DELETE rows older than 30 days ==="
+          CUTOFF=$(date -u -d '30 days ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -v-30d '+%Y-%m-%dT%H:%M:%SZ')
+          curl -s -o /dev/null -w "delete HTTP %{http_code}\n" -X DELETE \
+            -H "apikey: sb_publishable_5n4MzBgkg-B9-VUrLcjh8A_3JavCe8E" \
+            -H "Authorization: Bearer sb_publishable_5n4MzBgkg-B9-VUrLcjh8A_3JavCe8E" \
+            "https://frmbdsmhcdfglkbynteu.supabase.co/rest/v1/keepalive?pinged_at=lt.${CUTOFF}"
+
+      # ④ リポジトリを常にアクティブに保つ（GitHubの60日自動無効化を回避）
+      - name: Update heartbeat & self-commit
+        run: |
+          mkdir -p .keepalive
+          echo "last run: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" > .keepalive/heartbeat.txt
+          git config user.name "keep-alive-bot"
+          git config user.email "actions@github.com"
+          git add .keepalive/heartbeat.txt
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: keep-alive heartbeat [skip ci]"
+            git push
+          fi
